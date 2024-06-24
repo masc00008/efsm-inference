@@ -23,7 +23,7 @@ object Strategies extends Enumeration {
 
 object Preprocessors extends Enumeration {
   type Preprocessor = Value
-  val gp, dropGuards, none = Value
+  val gp, dropGuards, none, ehw = Value
 }
 
 case class Config(
@@ -33,11 +33,12 @@ case class Config(
   outputname: String = null,
   dotfiles: String = "dotfiles",
   nondeterminismMetric: IEFSM => FSet.fset[(Nat.nat, ((Nat.nat, Nat.nat), ((Types.Transition, List[Nat.nat]), (Types.Transition, List[Nat.nat]))))] = (Inference.nondeterministic_pairs _),
-  strategy: List[Nat.nat] => List[Nat.nat] => IEFSM => Nat.nat = (SelectionStrategies.naive_score _).curried,
+  strategy: List[Nat.nat] => List[Nat.nat] => IEFSM => Nat.nat = (Blue_Fringe.score_merge_size _).curried,
   skip: Boolean = false,
   logLevel: Level = Level.DEBUG,
   logFile: String = null,
   trainFile: File = null,
+  groups: File = null,
   train: List[List[Types.Event]] = List(),
   testFile: File = null,
   test: List[List[Types.Event]] = List(),
@@ -51,7 +52,8 @@ case class Config(
   blueFringe: Boolean=false,
   treeRepeats: Int = 2,
   transitionRepeats: Int = 2,
-  ngen: Int = 100
+  ngen: Int = 100,
+  pta : IEFSM = null
 )
 
 object Config {
@@ -186,6 +188,9 @@ object Config {
       opt[Int]('u', "updateSeed")
         .valueName("Random seed for update GP")
         .action((x, c) => c.copy(updateSeed = x)),
+      opt[File]("groups")
+        .action((x, c) => c.copy(groups = x))
+        .text("The json file listing the transition groups"),
       arg[File]("trainFile")
         .required()
         .action((x, c) => c.copy(trainFile = x))
@@ -203,13 +208,16 @@ object Config {
         if (config.logFile == null)
           config = config.copy(logFile = config.dotfiles + "/log")
         if (!Files.exists(Paths.get(config.dotfiles)))
-          new java.io.File(config.dotfiles).mkdirs
+          if (!new java.io.File(config.dotfiles).mkdirs)
+            throw new IllegalStateException(s"Could not create directory ${config.dotfiles}")
         if (Files.list(Paths.get(config.dotfiles)).findAny().isPresent())
           throw new IllegalArgumentException(s"Dotfiles directory '${config.dotfiles}' is not empty")
         if (Files.exists(Paths.get(config.logFile)))
           throw new IllegalArgumentException(s"Log file '${config.logFile}' already exists")
         if (config.k < 0)
           throw new IllegalArgumentException(s"k must be greater than 0")
+        if (config.prep == Preprocessors.ehw && config.groups == null)
+          throw new IllegalArgumentException(s"Must provide a groups file to use ehw preprocessing")
 
         // Set up the logs
         val trainParsed = parse(Source.fromFile(config.trainFile).getLines.mkString).values.asInstanceOf[List[List[Map[String, Any]]]]
@@ -218,25 +226,53 @@ object Config {
         val testParsed = parse(Source.fromFile(config.testFile).getLines.mkString).values.asInstanceOf[List[List[Map[String, Any]]]]
         config = config.copy(test = testParsed.map(run => run.map(x => TypeConversion.toEventTuple(x))))
 
+        // MAKE SURE THIS HAPPENS WHEN WE BUILD THE PTA IN THE CODE TOO, SPECIFICALLY IN distinguish
+        config = config.copy(pta = Inference.breadth_first_label(Inference.make_pta(config.train)))
+
         // Set up the heuristics
         val heuristics = scala.collection.immutable.Map(
           Heuristics.store -> (Store_Reuse.heuristic_1 _).curried(config.train),
           Heuristics.inputgen -> (Store_Reuse.heuristic_2 _).curried(config.train),
           Heuristics.inc -> (Increment_Reset.insert_increment_2 _).curried,
-          Heuristics.distinguish -> (Distinguishing_Guards.distinguish _).curried(config.train),
+          Heuristics.distinguish -> (Distinguishing_Guards.distinguish _).curried(config.pta)(config.train),
           Heuristics.same -> (Same_Register.same_register _).curried,
           Heuristics.ws -> (Weak_Subsumption.weak_subsumption _).curried,
           Heuristics.lob -> (Least_Upper_Bound.lob _).curried
         )
 
+        var transitionGroups: List[((String, (List[PTA_Generalisation.value_type], List[PTA_Generalisation.value_type])),
+               List[(List[Nat.nat], Transition.transition_ext[Unit])])] = null
+
+        if (config.groups != null) {
+          val parsedGroups = parse(Source.fromFile(config.groups).getLines.mkString).values.asInstanceOf[List[Map[String, Any]]]
+          transitionGroups = parsedGroups.map(x =>
+            (
+              (
+                x("label").asInstanceOf[String],
+                (
+                  x("inputs").asInstanceOf[List[String]].map(i => TypeConversion.value_type(i)),
+                  x("outputs").asInstanceOf[List[String]].map(i => TypeConversion.value_type(i)),
+                )
+              ),
+              x("transitions").asInstanceOf[List[List[BigInt]]].map(t =>
+                (
+                  t.map(n => Code_Numeral.nat_of_integer(n)),
+                  Inference.get_by_ids(config.pta, t.map(n => Code_Numeral.nat_of_integer(n)))
+                )
+              )
+            )
+          )
+         }
+
         // Set up the preprocessor
         val preprocessors = scala.collection.immutable.Map(
-          Preprocessors.gp -> (PTA_Generalisation.derestrict _).curried(Nat.Nata(config.treeRepeats))(Nat.Nata(config.transitionRepeats)),
+          Preprocessors.ehw -> (PTA_Generalisation.derestrict _).curried(transitionGroups)(Nat.Nata(config.treeRepeats))(Nat.Nata(config.transitionRepeats)),
+          Preprocessors.gp -> (PTA_Generalisation.historical_derestrict _).curried(Nat.Nata(config.treeRepeats))(Nat.Nata(config.transitionRepeats)),
           Preprocessors.dropGuards -> (PTA_Generalisation.drop_pta_guards _).curried
         )
         // Set up the postprocessor
         val postprocessors = scala.collection.immutable.Map(
-          Preprocessors.gp -> (PTA_Generalisation.derestrict _).curried(Nat.Nata(config.treeRepeats))(Nat.Nata(config.transitionRepeats)),
+          Preprocessors.gp -> (PTA_Generalisation.historical_derestrict _).curried(Nat.Nata(config.treeRepeats))(Nat.Nata(config.transitionRepeats)),
           Preprocessors.dropGuards -> (PTA_Generalisation.drop_pta_guards _).curried
         )
 
